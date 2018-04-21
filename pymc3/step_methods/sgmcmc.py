@@ -5,7 +5,7 @@ from .arraystep import Competence, ArrayStepShared
 from ..vartypes import continuous_types
 from ..model import modelcontext, inputvars
 import theano.tensor as tt
-from ..theanof import tt_rng, make_shared_replacements
+from ..theanof import tt_rng, make_shared_replacements, jacobian, floatX, inputs
 import theano
 import numpy as np
 
@@ -30,34 +30,76 @@ def _check_minibatches(minibatch_tensors, minibatches):
         hasattr(minibatches, "__iter__"), 'minibatches must be an iterator.')
 
 
-def prior_dlogp(vars, model, flat_view):
-    """Returns the gradient of the prior on the parameters as a vector of size D x 1"""
-    terms = tt.concatenate(
-        [theano.grad(var.logpt, var).flatten() for var in vars], axis=0)
-    dlogp = theano.clone(terms, flat_view.replacements, strict=False)
+def get_multi_obs_logp_elemwiset(model=None):
+    """Calculate the elementwise log-posterior for the model.
+    Handle case when there are more than one observed RVs
 
-    return dlogp
+    Parameters
+    ----------
+    model : PyMC Model
+        Optional model. Default None, taken from context.
+    Returns
+    -------
+    logp_elemwiset : array of shape (n_samples, n_observations)
+        The contribution of the observations to the logp of the whole model.
+    """
+    model = modelcontext(model)
+    cached = [(var, var.logp_elemwiset) for var in model.observed_RVs]
+
+    if len(cached) == 0:
+        return floatX(np.array([], dtype='d'))
+
+    logp_elemwiset = []
+    for var, logp in cached:
+        if var.missing_values:
+            logp = logp[~var.observations.mask]
+        logp_elemwiset.append(logp.ravel())
+    return tt.concatenate(logp_elemwiset, axis=1)
 
 
-def elemwise_dlogL(vars, model, flat_view):
+def get_log_prior(model=None):
+    """Calculate the elementwise log-prior for the model.
+
+    Parameters
+    ----------
+    vars
+    model : PyMC Model
+        Optional model. Default None, taken from context.
+    Returns
+    -------
+    log_prior : 0-D tensor
+    """
+    model = modelcontext(model)
+    hierarchy = {rv: [var for var in model.free_RVs if var in rv.distribution.__dict__.values()] for rv in model.free_RVs}
+    observed_rvs = [var for var in model.observed_RVs]
+    logprior = [input_rv for obs_rv in observed_rvs for input_rv in inputs([obs_rv.logpt]) if
+                input_rv in model.free_RVs]
+    logprior = [item.logpt for free_rv in logprior for item in hierarchy[free_rv] + [free_rv]]
+    return tt.sum(logprior)
+
+
+def get_elemwise_dlogL(vars=None, model=None, flat_view=None):
     """
     Returns Jacobian of the log likelihood for each training datum wrt vars
     as a matrix of size N x D
     """
-    # select one observed random variable
-    obs_var = model.observed_RVs[0]
-    # tensor of shape (batch_size,)
-    logL = obs_var.logp_elemwiset.sum(
-        axis=tuple(range(1, obs_var.logp_elemwiset.ndim)))
-    # calculate fisher information
-    terms = []
-    for var in vars:
-        output, _ =  theano.scan(lambda i, logX=logL, v=var: theano.grad(logX[i], v).flatten(),\
-                           sequences=[tt.arange(logL.shape[0])])
-        terms.append(output)
-    dlogL = theano.clone(
-        tt.concatenate(terms, axis=1), flat_view.replacements, strict=False)
-    return dlogL
+    # set model
+    model = modelcontext(model)
+
+    logp_elemwiset = get_multi_obs_logp_elemwiset(model)
+    log_prior = get_log_prior(model)
+    logL = logp_elemwiset + (tt.ones_like(logp_elemwiset) * log_prior)
+
+    dlogp_elemwiset = jacobian(logp_elemwiset, vars)
+    dlog_prior = jacobian(log_prior, vars).flatten()
+    dlogL = jacobian(logL, vars)
+
+    if flat_view is not None:
+        dlogp_elemwiset = theano.clone(dlogp_elemwiset, flat_view.replacements, strict=False)
+        dlog_prior = theano.clone(dlog_prior, flat_view.replacements, strict=False)
+        dlogL = theano.clone(dlogL, flat_view.replacements, strict=False)
+
+    return dlogp_elemwiset, dlog_prior, dlogL
 
 
 class BaseStochasticGradient(ArrayStepShared):
@@ -144,8 +186,7 @@ class BaseStochasticGradient(ArrayStepShared):
         flat_view = model.flatten(vars)
         self.inarray = [flat_view.input]
 
-        self.dlog_prior = prior_dlogp(vars, model, flat_view)
-        self.dlogp_elemwise = elemwise_dlogL(vars, model, flat_view)
+        self.dlogp_elemwise, self.dlog_prior, self.dlogL_elemwise = get_elemwise_dlogL(vars, model, flat_view)
         self.q_size = int(sum(v.dsize for v in self.vars))
 
         if minibatch_tensors != None:
